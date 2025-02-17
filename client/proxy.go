@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	"github.com/canonical/lxd/shared"
-	"github.com/canonical/microcluster/v2/client"
 
 	"github.com/canonical/microcloud/microcloud/api/types"
 )
@@ -27,23 +26,14 @@ type AuthConfig struct {
 // UseAuthProxy takes the given microcluster client and HMAC and proxies requests to other services through the MicroCloud API.
 // The HMAC will be set in the Authorization header in lieu of mTLS authentication, if present.
 // If no HMAC is present mTLS is assumed.
-func UseAuthProxy(c *client.Client, serviceType types.ServiceType, conf AuthConfig) (*client.Client, error) {
-	tp, ok := c.Transport.(*http.Transport)
-	if !ok {
-		return nil, fmt.Errorf("Invalid client transport type")
-	}
-
+func UseAuthProxy(transport *http.Transport, serviceType types.ServiceType, conf AuthConfig) {
 	// If the client is a unix client, it may not have any TLS config.
-	if tp.TLSClientConfig == nil {
-		tp.TLSClientConfig = &tls.Config{}
+	if transport.TLSClientConfig == nil {
+		transport.TLSClientConfig = &tls.Config{}
 	}
 
-	tp.TLSClientConfig.InsecureSkipVerify = conf.InsecureSkipVerify
-	tp.Proxy = AuthProxy(conf.HMAC, serviceType)
-
-	c.Transport = tp
-
-	return c, nil
+	transport.TLSClientConfig.InsecureSkipVerify = conf.InsecureSkipVerify
+	transport.Proxy = AuthProxy(conf.HMAC, serviceType)
 }
 
 // AuthProxy takes a request to a service and sends it to MicroCloud instead,

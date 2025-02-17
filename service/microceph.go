@@ -24,60 +24,65 @@ import (
 
 // CephService is a MicroCeph service.
 type CephService struct {
-	m *microcluster.MicroCluster
-
-	name    string
-	address string
-	port    int64
-	config  map[string]string
+	name     string
+	address  string
+	port     int64
+	config   map[string]string
+	stateDir string
+	proxyF   func(*http.Request) (*url.URL, error)
 }
 
 // NewCephService creates a new MicroCeph service with a client attached.
 func NewCephService(name string, addr string, cloudDir string) (*CephService, error) {
-	proxy := func(r *http.Request) (*url.URL, error) {
-		if !strings.HasPrefix(r.URL.Path, "/1.0/services/microceph") {
-			r.URL.Path = "/1.0/services/microceph" + r.URL.Path
-		}
-
-		return shared.ProxyFromEnvironment(r)
-	}
-
-	client, err := microcluster.App(microcluster.Args{StateDir: cloudDir, Proxy: proxy})
-	if err != nil {
-		return nil, err
-	}
-
 	return &CephService{
-		m:       client,
-		name:    name,
-		address: addr,
-		port:    CephPort,
-		config:  make(map[string]string),
+		name:     name,
+		address:  addr,
+		port:     CephPort,
+		config:   make(map[string]string),
+		stateDir: cloudDir,
+		proxyF: func(r *http.Request) (*url.URL, error) {
+			if !strings.HasPrefix(r.URL.Path, "/1.0/services/microceph") {
+				r.URL.Path = "/1.0/services/microceph" + r.URL.Path
+			}
+
+			return shared.ProxyFromEnvironment(r)
+		},
 	}, nil
 }
 
 // Client returns a client to the Ceph unix socket. If target is specified, it will be added to the query params.
 func (s CephService) Client(target string) (*client.Client, error) {
-	c, err := s.m.LocalClient()
+	app, err := cephClient.NewApp(microcluster.Args{StateDir: s.stateDir, Proxy: s.proxyF})
 	if err != nil {
 		return nil, err
+	}
+
+	c, err := app.LocalClient()
+	if err != nil {
+		return nil, fmt.Errorf("Failed creating MicroCeph local client: %w")
 	}
 
 	if target != "" {
-		c = c.UseTarget(target)
+		c.UseTarget(target)
 	}
 
-	c, err = cloudClient.UseAuthProxy(c, types.MicroCeph, cloudClient.AuthConfig{})
-	if err != nil {
-		return nil, err
+	transport, ok := c.Transport.(*http.Transport)
+	if !ok {
+		return nil, fmt.Errorf("Invalid client transport type")
 	}
 
+	cloudClient.UseAuthProxy(transport, types.MicroCeph, cloudClient.AuthConfig{})
 	return c, nil
 }
 
 // Bootstrap bootstraps the MicroCeph daemon on the default port.
 func (s CephService) Bootstrap(ctx context.Context) error {
-	err := s.m.NewCluster(ctx, s.name, util.CanonicalNetworkAddress(s.address, s.port), s.config)
+	app, err := cephClient.NewApp(microcluster.Args{StateDir: s.stateDir, Proxy: s.proxyF})
+	if err != nil {
+		return fmt.Errorf("Failed creating MicroCeph instance: %w")
+	}
+
+	err = app.NewCluster(ctx, s.name, util.CanonicalNetworkAddress(s.address, s.port), s.config)
 	if err != nil {
 		return err
 	}
@@ -105,22 +110,36 @@ func (s CephService) Bootstrap(ctx context.Context) error {
 
 // IssueToken issues a token for the given peer. Each token will last 5 minutes in case the system joins the cluster very slowly.
 func (s CephService) IssueToken(ctx context.Context, peer string) (string, error) {
-	return s.m.NewJoinToken(ctx, peer, 5*time.Minute)
+	app, err := cephClient.NewApp(microcluster.Args{StateDir: s.stateDir, Proxy: s.proxyF})
+	if err != nil {
+		return "", fmt.Errorf("Failed creating MicroCeph instance: %w")
+	}
+
+	return app.NewJoinToken(ctx, peer, 5*time.Minute)
 }
 
 // DeleteToken deletes a token by its name.
 func (s CephService) DeleteToken(ctx context.Context, tokenName string, address string) error {
+	app, err := cephClient.NewApp(microcluster.Args{StateDir: s.stateDir, Proxy: s.proxyF})
+	if err != nil {
+		return fmt.Errorf("Failed creating MicroCeph instance: %w")
+	}
+
 	var c *client.Client
-	var err error
 	if address != "" {
-		c, err = s.m.RemoteClient(util.CanonicalNetworkAddress(address, CloudPort))
+		c, err = app.RemoteClient(util.CanonicalNetworkAddress(address, CloudPort))
 		if err != nil {
 			return err
 		}
 
-		c, err = cloudClient.UseAuthProxy(c, types.MicroCeph, cloudClient.AuthConfig{})
+		transport, ok := c.Transport.(*http.Transport)
+		if !ok {
+			return fmt.Errorf("Invalid client transport type")
+		}
+
+		cloudClient.UseAuthProxy(transport, types.MicroCeph, cloudClient.AuthConfig{})
 	} else {
-		c, err = s.m.LocalClient()
+		c, err = app.LocalClient()
 	}
 
 	if err != nil {
@@ -132,7 +151,12 @@ func (s CephService) DeleteToken(ctx context.Context, tokenName string, address 
 
 // Join joins a cluster with the given token.
 func (s CephService) Join(ctx context.Context, joinConfig JoinConfig) error {
-	err := s.m.JoinCluster(ctx, s.name, util.CanonicalNetworkAddress(s.address, s.port), joinConfig.Token, nil)
+	app, err := cephClient.NewApp(microcluster.Args{StateDir: s.stateDir, Proxy: s.proxyF})
+	if err != nil {
+		return fmt.Errorf("Failed creating MicroCeph instance: %w")
+	}
+
+	err = app.JoinCluster(ctx, s.name, util.CanonicalNetworkAddress(s.address, s.port), joinConfig.Token, nil)
 	if err != nil {
 		return err
 	}
@@ -155,14 +179,18 @@ func (s CephService) Join(ctx context.Context, joinConfig JoinConfig) error {
 // remoteClient returns an https client for the given address:port.
 // It picks the cluster certificate if none is provided to verify the remote.
 func (s CephService) remoteClient(cert *x509.Certificate, address string) (*client.Client, error) {
-	var err error
+	app, err := cephClient.NewApp(microcluster.Args{StateDir: s.stateDir, Proxy: s.proxyF})
+	if err != nil {
+		return nil, fmt.Errorf("Failed creating MicroCeph instance: %w")
+	}
+
 	var client *client.Client
 
 	canonicalAddress := util.CanonicalNetworkAddress(address, CloudPort)
 	if cert != nil {
-		client, err = s.m.RemoteClientWithCert(canonicalAddress, cert)
+		client, err = app.RemoteClientWithCert(canonicalAddress, cert)
 	} else {
-		client, err = s.m.RemoteClient(canonicalAddress)
+		client, err = app.RemoteClient(canonicalAddress)
 	}
 
 	if err != nil {
@@ -180,11 +208,12 @@ func (s CephService) RemoteClusterMembers(ctx context.Context, cert *x509.Certif
 		return nil, err
 	}
 
-	client, err = cloudClient.UseAuthProxy(client, types.MicroCeph, cloudClient.AuthConfig{})
-	if err != nil {
-		return nil, err
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		return nil, fmt.Errorf("Invalid client transport type")
 	}
 
+	cloudClient.UseAuthProxy(transport, types.MicroCeph, cloudClient.AuthConfig{})
 	return clusterMembers(ctx, client)
 }
 
@@ -200,7 +229,12 @@ func (s CephService) ClusterMembers(ctx context.Context) (map[string]string, err
 
 // DeleteClusterMember removes the given cluster member from the service.
 func (s CephService) DeleteClusterMember(ctx context.Context, name string, force bool) error {
-	c, err := s.m.LocalClient()
+	app, err := cephClient.NewApp(microcluster.Args{StateDir: s.stateDir, Proxy: s.proxyF})
+	if err != nil {
+		return fmt.Errorf("Failed creating MicroCeph instance: %w")
+	}
+
+	c, err := app.LocalClient()
 	if err != nil {
 		return err
 	}
@@ -223,10 +257,12 @@ func (s CephService) ClusterConfig(ctx context.Context, targetAddress string, ce
 			return nil, err
 		}
 
-		c, err = cloudClient.UseAuthProxy(c, types.MicroCeph, cloudClient.AuthConfig{})
-		if err != nil {
-			return nil, err
+		transport, ok := c.Transport.(*http.Transport)
+		if !ok {
+			return nil, fmt.Errorf("Invalid client transport type")
 		}
+
+		cloudClient.UseAuthProxy(transport, types.MicroCeph, cloudClient.AuthConfig{})
 	}
 
 	data := cephTypes.Config{}
@@ -265,7 +301,12 @@ func (s CephService) Port() int64 {
 
 // GetVersion gets the installed daemon version of the service, and returns an error if the version is not supported.
 func (s CephService) GetVersion(ctx context.Context) (string, error) {
-	status, err := s.m.Status(ctx)
+	app, err := cephClient.NewApp(microcluster.Args{StateDir: s.stateDir, Proxy: s.proxyF})
+	if err != nil {
+		return "", fmt.Errorf("Failed creating MicroCeph instance: %w")
+	}
+
+	status, err := app.Status(ctx)
 	if err != nil && api.StatusErrorCheck(err, http.StatusNotFound) {
 		return "", fmt.Errorf("The installed version of %s is not supported", s.Type())
 	}
@@ -284,7 +325,12 @@ func (s CephService) GetVersion(ctx context.Context) (string, error) {
 
 // IsInitialized returns whether the service is initialized.
 func (s CephService) IsInitialized(ctx context.Context) (bool, error) {
-	err := s.m.Ready(ctx)
+	app, err := cephClient.NewApp(microcluster.Args{StateDir: s.stateDir, Proxy: s.proxyF})
+	if err != nil {
+		return false, fmt.Errorf("Failed creating MicroCeph instance: %w")
+	}
+
+	err = app.Ready(ctx)
 	if err != nil && api.StatusErrorCheck(err, http.StatusNotFound) {
 		return false, fmt.Errorf("Unix socket not found. Check if %s is installed", s.Type())
 	}
@@ -293,7 +339,7 @@ func (s CephService) IsInitialized(ctx context.Context) (bool, error) {
 		return false, fmt.Errorf("Failed to wait for %s to get ready: %w", s.Type(), err)
 	}
 
-	status, err := s.m.Status(ctx)
+	status, err := app.Status(ctx)
 	if err != nil {
 		return false, fmt.Errorf("Failed to get %s status: %w", s.Type(), err)
 	}
@@ -314,7 +360,12 @@ func (s *CephService) SetConfig(config map[string]string) {
 
 // SupportsFeature checks if the specified API feature of this Service instance if supported.
 func (s *CephService) SupportsFeature(ctx context.Context, feature string) (bool, error) {
-	server, err := s.m.Status(ctx)
+	app, err := cephClient.NewApp(microcluster.Args{StateDir: s.stateDir, Proxy: s.proxyF})
+	if err != nil {
+		return false, fmt.Errorf("Failed creating MicroCeph instance: %w")
+	}
+
+	server, err := app.Status(ctx)
 	if err != nil {
 		return false, fmt.Errorf("Failed to get MicroCeph server status while checking for features: %v", err)
 	}

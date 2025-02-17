@@ -1,9 +1,15 @@
 module github.com/canonical/microcloud/microcloud
 
-go 1.22.7
+go 1.23.3
+
+toolchain go1.24.0
+
+replace github.com/canonical/microceph/microceph => /home/julian/dev/others/microceph/microceph
+
+replace github.com/canonical/microovn/microovn => /home/julian/dev/others/microovn/microovn
 
 require (
-	github.com/canonical/lxd v0.0.0-20241106165613-4aab50ec18c3
+	github.com/canonical/lxd v0.0.0-20250114180824-cc21f909e416
 	github.com/canonical/microceph/microceph v0.0.0-20241021172252-2dd856d64c62
 	github.com/canonical/microcluster/v2 v2.1.0
 	github.com/canonical/microovn/microovn v0.0.0-20241101125123-0d5d663f6575
@@ -12,7 +18,7 @@ require (
 	github.com/charmbracelet/x/ansi v0.8.0
 	github.com/gorilla/mux v1.8.1
 	github.com/gorilla/websocket v1.5.3
-	github.com/spf13/cobra v1.8.1
+	github.com/spf13/cobra v1.9.1
 	github.com/stretchr/testify v1.10.0
 	golang.org/x/mod v0.23.0
 	golang.org/x/net v0.34.0
@@ -27,6 +33,7 @@ require (
 	github.com/armon/go-proxyproto v0.1.0 // indirect
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
 	github.com/canonical/go-dqlite/v2 v2.0.0 // indirect
+	github.com/canonical/go-dqlite/v3 v3.0.0 // indirect
 	github.com/charmbracelet/x/term v0.2.1 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect
@@ -60,15 +67,16 @@ require (
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/robfig/cron/v3 v3.0.1 // indirect
 	github.com/sirupsen/logrus v1.9.3 // indirect
-	github.com/spf13/pflag v1.0.5 // indirect
+	github.com/spf13/pflag v1.0.6 // indirect
 	github.com/zitadel/logging v0.6.1 // indirect
-	github.com/zitadel/oidc/v3 v3.32.1 // indirect
+	github.com/zitadel/oidc/v3 v3.34.0 // indirect
 	github.com/zitadel/schema v1.3.0 // indirect
-	go.opentelemetry.io/otel v1.31.0 // indirect
-	go.opentelemetry.io/otel/metric v1.31.0 // indirect
-	go.opentelemetry.io/otel/trace v1.31.0 // indirect
+	go.opentelemetry.io/auto/sdk v1.1.0 // indirect
+	go.opentelemetry.io/otel v1.33.0 // indirect
+	go.opentelemetry.io/otel/metric v1.33.0 // indirect
+	go.opentelemetry.io/otel/trace v1.33.0 // indirect
 	golang.org/x/crypto v0.32.0 // indirect
-	golang.org/x/oauth2 v0.23.0 // indirect
+	golang.org/x/oauth2 v0.25.0 // indirect
 	golang.org/x/term v0.28.0 // indirect
 	golang.org/x/text v0.21.0 // indirect
 )

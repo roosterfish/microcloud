@@ -114,13 +114,17 @@ func (s CloudService) DeleteToken(ctx context.Context, tokenName string, address
 			return err
 		}
 
-		c, err = cloudClient.UseAuthProxy(c, types.MicroCloud, cloudClient.AuthConfig{})
+		transport, ok := c.Transport.(*http.Transport)
+		if !ok {
+			return fmt.Errorf("Invalid client transport type")
+		}
+
+		cloudClient.UseAuthProxy(transport, types.MicroCloud, cloudClient.AuthConfig{})
 	} else {
 		c, err = s.client.LocalClient()
-	}
-
-	if err != nil {
-		return err
+		if err != nil {
+			return err
+		}
 	}
 
 	return c.DeleteTokenRecord(ctx, tokenName)
@@ -133,11 +137,12 @@ func (s CloudService) RemoteIssueToken(ctx context.Context, clusterAddress strin
 		return "", err
 	}
 
-	c, err = cloudClient.UseAuthProxy(c, types.MicroCloud, cloudClient.AuthConfig{})
-	if err != nil {
-		return "", err
+	transport, ok := c.Transport.(*http.Transport)
+	if !ok {
+		return "", fmt.Errorf("Invalid client transport type")
 	}
 
+	cloudClient.UseAuthProxy(transport, types.MicroCloud, cloudClient.AuthConfig{})
 	return client.RemoteIssueToken(ctx, c, serviceType, types.ServiceTokensPost{ClusterAddress: c.URL().URL.Host, JoinerName: peer})
 }
 
@@ -184,10 +189,12 @@ func (s CloudService) RequestJoin(ctx context.Context, name string, cert *x509.C
 			return err
 		}
 
-		c, err = cloudClient.UseAuthProxy(c, types.MicroCloud, cloudClient.AuthConfig{})
-		if err != nil {
-			return err
+		transport, ok := c.Transport.(*http.Transport)
+		if !ok {
+			return fmt.Errorf("Invalid client transport type")
 		}
+
+		cloudClient.UseAuthProxy(transport, types.MicroCloud, cloudClient.AuthConfig{})
 	}
 
 	return client.JoinServices(ctx, c, joinConfig)
@@ -200,11 +207,12 @@ func (s CloudService) RequestJoinIntent(ctx context.Context, clusterAddress stri
 		return nil, err
 	}
 
-	c, err = cloudClient.UseAuthProxy(c, types.MicroCloud, conf)
-	if err != nil {
-		return nil, err
+	transport, ok := c.Transport.(*http.Transport)
+	if !ok {
+		return nil, fmt.Errorf("Invalid client transport type")
 	}
 
+	cloudClient.UseAuthProxy(transport, types.MicroCloud, conf)
 	return client.JoinIntent(ctx, c, intent)
 }
 
@@ -216,11 +224,12 @@ func (s CloudService) RemoteClusterMembers(ctx context.Context, cert *x509.Certi
 		return nil, err
 	}
 
-	client, err = cloudClient.UseAuthProxy(client, types.MicroCloud, cloudClient.AuthConfig{})
-	if err != nil {
-		return nil, err
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		return nil, fmt.Errorf("Invalid client transport type")
 	}
 
+	cloudClient.UseAuthProxy(transport, types.MicroCloud, cloudClient.AuthConfig{})
 	return clusterMembers(ctx, client)
 }
 
@@ -231,10 +240,12 @@ func (s CloudService) RemoteStatus(ctx context.Context, cert *x509.Certificate, 
 		return nil, err
 	}
 
-	client, err = cloudClient.UseAuthProxy(client, types.MicroCloud, cloudClient.AuthConfig{})
-	if err != nil {
-		return nil, err
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		return nil, fmt.Errorf("Invalid client transport type")
 	}
+
+	cloudClient.UseAuthProxy(transport, types.MicroCloud, cloudClient.AuthConfig{})
 
 	status := Status{}
 	err = client.Query(ctx, "GET", "core/1.0", nil, nil, &status)
@@ -382,10 +393,11 @@ func (s *CloudService) RemoteClient(cert *x509.Certificate, address string) (*mi
 		return nil, err
 	}
 
-	c, err = cloudClient.UseAuthProxy(c, types.MicroCloud, cloudClient.AuthConfig{})
-	if err != nil {
-		return nil, err
+	transport, ok := c.Transport.(*http.Transport)
+	if !ok {
+		return nil, fmt.Errorf("Invalid client transport type")
 	}
 
+	cloudClient.UseAuthProxy(transport, types.MicroCloud, cloudClient.AuthConfig{})
 	return c, nil
 }
