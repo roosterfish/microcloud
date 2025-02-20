@@ -161,7 +161,11 @@ custom_linkcheck_anchors_ignore_for_url = [
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#confval-linkcheck_timeout
 linkcheck_rate_limit_timeout = 600
 
-# Increase linkcheck retries, default when unset is 1
+# Increase linkcheck timeout to five minutes, default when unset is 30.
+linkcheck_timeout = 300
+
+# Increase linkcheck retries, default when unset is 1.
+# Together with the linkcheck timeout this allows the upstream to be not responsive for 15 minutes.
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#confval-linkcheck_retries
 linkcheck_retries = 3
 
