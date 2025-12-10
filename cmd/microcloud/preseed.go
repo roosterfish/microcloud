@@ -1090,7 +1090,7 @@ func (p *Preseed) Parse(s *service.Handler, c *initConfig, installedServices map
 		}
 
 		if osdHosts < RecommendedOSDHosts {
-			fmt.Printf("Warning: OSD host count is less than %d. Distributed storage is not fault-tolerant\n", RecommendedOSDHosts)
+			tui.PrintWarning(fmt.Sprintf("OSD host count is less than %d. Distributed storage is not fault-tolerant", RecommendedOSDHosts))
 		}
 	}
 
