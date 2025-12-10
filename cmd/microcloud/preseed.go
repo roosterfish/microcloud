@@ -725,21 +725,9 @@ func (p *Preseed) Parse(s *service.Handler, c *initConfig, installedServices map
 		c.systems[name] = system
 	}
 
-	lxd := s.Services[types.LXD].(*service.LXDService)
-
 	if c.bootstrap {
-		microCloudSubnetInterface, err := lxd.FindInterfaceForSubnet(p.LookupSubnet)
-		if err != nil {
-			return nil, err
-		}
-
-		ipLookupSubnet, lookupSubnet, err := net.ParseCIDR(p.LookupSubnet)
-		if err != nil {
-			return nil, err
-		}
-
 		bootstrapSystem := c.systems[s.Name]
-		bootstrapSystem.MicroCloudInternalNetwork = &NetworkInterfaceInfo{Interface: *microCloudSubnetInterface, Subnet: lookupSubnet, IP: ipLookupSubnet}
+		bootstrapSystem.MicroCloudInternalNetwork = &NetworkInterfaceInfo{Interface: *c.lookupIface, Subnet: c.lookupSubnet, IP: c.lookupSubnet.IP}
 		c.systems[s.Name] = bootstrapSystem
 	}
 
@@ -759,6 +747,8 @@ func (p *Preseed) Parse(s *service.Handler, c *initConfig, installedServices map
 	if err != nil {
 		return nil, err
 	}
+
+	lxd := s.Services[types.LXD].(*service.LXDService)
 
 	// If an uplink interface was explicitly chosen, we will try to set up an OVN network.
 	explicitOVN := len(ifaceByPeer) > 0
