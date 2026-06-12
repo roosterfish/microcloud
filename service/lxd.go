@@ -764,14 +764,20 @@ func (s *LXDService) WaitReady(ctx context.Context, c lxd.InstanceServer, networ
 	}
 
 	for {
+		var lastErr error
+
 		_, _, err := c.RawQuery("GET", url.String(), nil, "")
 		if err != nil {
+			lastErr = err
+
 			if ctx.Err() == nil {
 				time.Sleep(500 * time.Millisecond)
 				continue
 			}
 
-			return fmt.Errorf("Failed waiting for LXD to start: %w", err)
+			// The context expired and ctx.Err() != nil.
+			// Primarily return the last error and keep the context error as secondary.
+			return fmt.Errorf("Failed waiting for LXD to start: %w (%w)", lastErr, ctx.Err())
 		}
 
 		break
