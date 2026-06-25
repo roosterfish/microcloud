@@ -1,0 +1,336 @@
+# Copyright 2024 Canonical Ltd.
+# See LICENSE file for licensing details.
+
+# TODO: Get rid of ca_file config for LXD metrics scrape completely then re-check if metrics end up on prometheus.
+
+name: microcloud
+type: charm
+subordinate: false
+
+summary: Deploy and operate a MicroCloud cluster, optionally connected to observability.
+
+description: |
+  The MicroCloud charm deploys and operates a MicroCloud cluster (LXD,
+  MicroCeph, MicroOVN) across a set of machines, and can optionally connect
+  that cluster to the Canonical Observability Stack (COS).
+
+  Deployment mode (auto-detected)
+  -------------------------------
+  On each machine the charm detects whether MicroCloud is already
+  initialized:
+
+    - If MicroCloud is NOT yet initialized, the charm installs the required
+      snaps (microcloud, lxd, and optionally microceph and microovn) at the
+      configured channels and forms the cluster non-interactively using
+      "microcloud preseed". The leader unit acts as the initiator; all other
+      units join. A shared session passphrase is generated automatically and
+      distributed to peers via a Juju secret.
+
+    - If MicroCloud IS already initialized (a cluster deployed out-of-band),
+      the charm does not install snaps or bootstrap. It instead validates
+      that every MicroCloud member has a corresponding Juju unit (matched on
+      hostname) and blocks if any member is missing.
+
+  Observability (optional)
+  ------------------------
+  Metrics integration is only configured when a related
+  opentelemetry-collector subordinate is attached via the cos-agent relation.
+  When related, the charm ensures Prometheus-compatible endpoints exist for
+  LXD, MicroCeph, and MicroOVN and advertises them. When the relation is
+  removed, the metrics setup is torn down. A base MicroCloud deployment
+  performs no metrics setup.
+
+links:
+  source: https://github.com/canonical/microcloud
+  issues: https://github.com/canonical/microcloud/issues
+
+assumes:
+  - juju >= 3.6
+
+platforms:
+  ubuntu@22.04:amd64:
+  ubuntu@22.04:arm64:
+  ubuntu@24.04:amd64:
+  ubuntu@24.04:arm64:
+
+parts:
+  charm:
+    source: .
+    plugin: uv
+    build-packages:
+      - git
+      - python3
+    build-snaps:
+      - astral-uv
+    override-build: |
+      # Fetch upstream dashboards before the uv plugin stages the charm files.
+      python3 tools/fetch-dashboards.py
+      craftctl default
+
+peers:
+  cluster:
+    interface: microcloud-peer
+
+provides:
+  cos-agent:
+    interface: cos_agent
+
+config:
+  options:
+    # ------------------------------------------------------------------
+    # Snap channels (deployment mode only)
+    # ------------------------------------------------------------------
+    snap-channel-microcloud:
+      type: string
+      default: "3/stable"
+      description: >
+        Snap channel for the microcloud snap. Only used when the charm
+        deploys the cluster (i.e. MicroCloud is not already initialized).
+
+    snap-channel-lxd:
+      type: string
+      default: "6/stable"
+      description: >
+        Snap channel for the lxd snap. LXD is always required by MicroCloud.
+
+    snap-channel-microceph:
+      type: string
+      default: "squid/stable"
+      description: >
+        Snap channel for the microceph snap. Leave empty to deploy a
+        MicroCloud without MicroCeph; the ceph preseed section is then
+        omitted.
+
+    snap-channel-microovn:
+      type: string
+      default: "24.03/stable"
+      description: >
+        Snap channel for the microovn snap. Leave empty to deploy a
+        MicroCloud without MicroOVN; the ovn preseed section is then omitted.
+
+    # ------------------------------------------------------------------
+    # Cluster bootstrap / session (deployment mode only)
+    # ------------------------------------------------------------------
+    session-passphrase:
+      type: string
+      default: ""
+      description: >
+        Shared passphrase used to authenticate the MicroCloud trust
+        establishment session. If empty (default), the leader generates a
+        random passphrase and shares it with peers via a Juju secret.
+
+    session-timeout:
+      type: int
+      default: 300
+      description: >
+        Seconds the initiator keeps the trust-establishment session open
+        while waiting for joiners. Bumped from the MicroCloud CLI default
+        (60 min) down to 5 min, but raised well above the MicroCloud CLI's
+        own lookup-timeout default (60s), so the initiator reliably
+        outlasts joiners whose own hooks may run on a delayed Juju
+        schedule.
+
+    lookup-timeout:
+      type: int
+      default: 300
+      description: >
+        Seconds a joiner waits for the initiator to reply once connected.
+        Bumped from the MicroCloud CLI default (60s) to 5 min so slow
+        installs/config-changed backlogs don't cause the join attempt to
+        time out. Note this only bounds the wait *after* connecting; if the
+        initiator has not started its own "microcloud preseed" session yet,
+        the joiner is rejected immediately ("No active session") rather
+        than waiting - see bootstrap-retries for handling that race.
+
+    bootstrap-retries:
+      type: int
+      default: 10
+      description: >
+        How many times to retry "microcloud preseed" within a single hook
+        execution if it fails. We use unicast (not multicast) joining, so
+        a joiner must dial the initiator's already-open session; if the
+        joiner's own hook runs before the initiator has started its
+        session (still installing snaps, or its hook hasn't fired yet),
+        the joiner is rejected immediately with "No active session"
+        rather than waiting, since no timeout governs that race. Retrying
+        a few times lets the joiner catch up once the initiator's session
+        is open, instead of waiting for Juju's much slower periodic
+        update-status reconciliation. Set to 0 to disable and rely solely
+        on update-status retries.
+
+    bootstrap-retry-delay:
+      type: int
+      default: 15
+      description: >
+        Seconds to wait between "microcloud preseed" retries (see
+        bootstrap-retries).
+
+    # ------------------------------------------------------------------
+    # Ceph preseed options
+    # ------------------------------------------------------------------
+    ceph-cephfs:
+      type: boolean
+      default: false
+      description: Enable CephFS during cluster bootstrap.
+
+    ceph-public-network:
+      type: string
+      default: ""
+      description: Ceph public network subnet (CIDR). Optional.
+
+    ceph-internal-network:
+      type: string
+      default: ""
+      description: Ceph internal/cluster network subnet (CIDR). Optional.
+
+    # ------------------------------------------------------------------
+    # Storage disk-filter options (fallback for systems without explicit disks)
+    # ------------------------------------------------------------------
+    storage-local-find:
+      type: string
+      default: ""
+      description: >
+        LXD resource filter expression selecting the local (zpool) disk on
+        each system, e.g. "size > 100GiB && type == nvme". Optional.
+
+    storage-ceph-find:
+      type: string
+      default: ""
+      description: >
+        LXD resource filter expression selecting disks to contribute to Ceph
+        OSDs on each system. Optional.
+
+    storage-wipe:
+      type: boolean
+      default: false
+      description: Wipe selected disks before use. Applies to disk-filter matches.
+
+    storage-encrypt:
+      type: boolean
+      default: false
+      description: Encrypt selected disks. Applies to disk-filter matches.
+
+    # ------------------------------------------------------------------
+    # OVN uplink preseed options
+    # ------------------------------------------------------------------
+    ovn-uplink-interface:
+      type: string
+      default: ""
+      description: >
+        Name of the uplink network interface on each system. If set, all
+        systems use this interface for the OVN uplink network.
+
+    ovn-ipv4-gateway:
+      type: string
+      default: ""
+      description: OVN uplink IPv4 gateway in CIDR notation. Optional.
+
+    ovn-ipv4-range:
+      type: string
+      default: ""
+      description: >
+        OVN uplink IPv4 range, e.g. "192.0.2.100-192.0.2.254". Optional.
+
+    ovn-ipv6-gateway:
+      type: string
+      default: ""
+      description: OVN uplink IPv6 gateway in CIDR notation. Optional.
+
+    ovn-dns-servers:
+      type: string
+      default: ""
+      description: Comma-separated OVN uplink DNS servers. Optional.
+
+    ovn-underlay-ip:
+      type: string
+      default: ""
+      description: >
+        Per-system Geneve underlay IP. If set on the leader, all systems must
+        provide one; typically left empty for automatic selection.
+
+    # ------------------------------------------------------------------
+    # Observability options (used only when cos-agent is related)
+    # ------------------------------------------------------------------
+    microcloud-cluster-name:
+      type: string
+      default: ""
+      description: >
+        Label written into all scraped telemetry as microcloud_cluster.
+        If empty (default), the Juju application name is used.
+
+    scrape-interval:
+      type: string
+      default: "30s"
+      description: >
+        Prometheus-style scrape interval forwarded to the collector for all
+        scrape jobs (e.g. "30s", "1m").
+
+    ceph-mgr-prometheus-port:
+      type: int
+      default: 9283
+      description: >
+        Port on which the Ceph mgr Prometheus module listens on loopback.
+
+    ovn-exporter-channel:
+      type: string
+      default: "latest/edge"
+      description: >
+        Snap Store channel for the ovn-exporter snap (observability only).
+
+    ovn-exporter-listen-port:
+      type: int
+      default: 9310
+      description: >
+        Port on which the ovn-exporter snap listens on loopback.
+
+    enable-lxd:
+      type: boolean
+      default: true
+      description: >
+        If false, skip LXD metrics configuration and do not advertise a LXD
+        scrape job.
+
+    enable-microceph:
+      type: boolean
+      default: true
+      description: >
+        If false, skip the Ceph mgr Prometheus module setup and do not
+        advertise a MicroCeph scrape job.
+
+    enable-microovn:
+      type: boolean
+      default: true
+      description: >
+        If false, skip ovn-exporter snap installation and do not advertise
+        a MicroOVN scrape job.
+
+    cleanup-on-remove:
+      type: boolean
+      default: true
+      description: >
+        If true (default), removing the cos-agent relation or the charm also
+        removes the ovn-exporter snap and resets the LXD metrics
+        configuration. The MicroCloud cluster itself is never destroyed by
+        the charm.
+
+actions:
+  bootstrap:
+    description: >
+      Manually (re-)trigger MicroCloud cluster bootstrap via preseed. Only
+      valid in deployment mode (when MicroCloud is not already initialized).
+      Normally the charm does this automatically once all peers are present.
+
+  status:
+    description: >
+      Print the detected charm mode and the current MicroCloud cluster
+      membership as seen by this unit.
+
+  force-reconcile:
+    description: >
+      Re-run idempotent setup steps: deployment reconciliation and, when the
+      cos-agent relation is present, observability endpoint configuration.
+
+  dump-config:
+    description: >
+      Print the cos-agent scrape configs this unit is advertising. Useful for
+      debugging observability integration.

@@ -52,19 +52,29 @@ endif
 check: check-static check-unit check-system
 
 .PHONY: check-unit
-check-unit:
+check-unit: check-unit-go check-unit-charm
+
+.PHONY: check-unit-go
+check-unit-go:
 ifeq "$(GOCOVERDIR)" ""
 	go test ./...
 else
 	go test ./... -cover -test.gocoverdir="${GOCOVERDIR}"
 endif
 
+.PHONY: check-unit-charm
+check-unit-charm:
+	cd charm && tox -e unit
+
 .PHONY: check-system
 check-system:
 	cd test && ./main.sh
 
 .PHONY: check-static
-check-static:
+check-static: check-static-go check-static-charm
+
+.PHONY: check-static-go
+check-static-go:
 ifeq ($(shell command -v golangci-lint 2> /dev/null),)
 	curl -sSfL https://golangci-lint.run/install.sh | sh -s -- -b $$HOME/go/bin latest
 endif
@@ -74,6 +84,15 @@ endif
 	golangci-lint run --timeout 5m
 	revive -config revive.toml -exclude ./cmd/... -set_exit_status ./...
 	run-parts --exit-on-error --regex '.sh' test/lint
+
+.PHONY: check-static-charm
+check-static-charm:
+	cd charm && tox -e lint
+
+# Build the charm artefact (requires charmcraft).
+.PHONY: build-charm
+build-charm:
+	cd charm && charmcraft pack
 
 # Update targets.
 .PHONY: update-gomod
