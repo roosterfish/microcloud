@@ -5,8 +5,9 @@
 
 Responsibilities
 ----------------
-- Publish this unit's MicroCloud identity (hostname + bind address) on the
-  peer relation databag.
+- Publish this unit's MicroCloud identity (hostname + bind address, plus
+  any attached "local"/"ceph" Juju storage device paths) on the peer
+  relation databag.
 - Collect the identities of all peer units so the leader can assemble the
   full ``systems`` list for preseed.
 - Manage the shared session passphrase via a Juju secret (leader-owned),
@@ -15,8 +16,10 @@ Responsibilities
   hostname), in both directions.
 """
 
+import json
 import logging
 import secrets
+from dataclasses import dataclass, field
 
 import ops
 
@@ -27,6 +30,10 @@ PEER_RELATION = "cluster"
 # Peer databag keys (per-unit).
 _KEY_NAME = "microcloud-name"
 _KEY_ADDRESS = "microcloud-address"
+_KEY_OVN_UPLINK_INTERFACE = "microcloud-ovn-uplink-interface"
+_KEY_OVN_UNDERLAY_IP = "microcloud-ovn-underlay-ip"
+_KEY_STORAGE_LOCAL_PATH = "microcloud-storage-local-path"
+_KEY_STORAGE_CEPH_PATHS = "microcloud-storage-ceph-paths"
 _KEY_READY = "microcloud-ready"
 _KEY_ACK = "microcloud-initiator-ack"
 
@@ -35,6 +42,18 @@ _APP_KEY_SECRET_ID = "session-passphrase-secret-id"
 _SECRET_LABEL = "microcloud-session-passphrase"
 _SECRET_FIELD = "passphrase"
 _APP_KEY_INITIATOR_ADDRESS = "initiator-address"
+
+
+@dataclass
+class PeerSystem:
+    """A peer unit's published MicroCloud identity."""
+
+    name: str
+    address: str
+    ovn_uplink_interface: str = ""
+    ovn_underlay_ip: str = ""
+    storage_local_path: str = ""
+    storage_ceph_paths: list[str] = field(default_factory=list)
 
 
 class ClusterCoordinator:
@@ -59,38 +78,84 @@ class ClusterCoordinator:
     # Unit identity
     # ------------------------------------------------------------------
 
-    def publish_identity(self, name: str, address: str) -> None:
-        """Publish this unit's MicroCloud name and address on the peer databag."""
+    def publish_identity(
+        self,
+        name: str,
+        address: str,
+        ovn_uplink_interface: str = "",
+        ovn_underlay_ip: str = "",
+        storage_local_path: str = "",
+        storage_ceph_paths: list[str] | None = None,
+    ) -> None:
+        """Publish this unit's MicroCloud identity on the peer databag.
+
+        ``ovn_uplink_interface``, ``ovn_underlay_ip``, and the storage
+        device paths are naturally per-unit (derived from this unit's own
+        space bindings / attached Juju storage volumes), so they are
+        published and collected the same way as name/address, rather than
+        being a single value shared application-wide.
+        """
         relation = self.relation
         if relation is None:
             return
         relation.data[self._charm.unit][_KEY_NAME] = name
         relation.data[self._charm.unit][_KEY_ADDRESS] = address
+        relation.data[self._charm.unit][_KEY_OVN_UPLINK_INTERFACE] = ovn_uplink_interface
+        relation.data[self._charm.unit][_KEY_OVN_UNDERLAY_IP] = ovn_underlay_ip
+        relation.data[self._charm.unit][_KEY_STORAGE_LOCAL_PATH] = storage_local_path
+        relation.data[self._charm.unit][_KEY_STORAGE_CEPH_PATHS] = json.dumps(
+            storage_ceph_paths or []
+        )
 
     def all_members(self) -> list[tuple[str, str]]:
         """Return (name, address) for every peer unit that has published, plus self.
 
         Only entries with both a name and an address are returned.
         """
+        return [(system.name, system.address) for system in self.all_systems()]
+
+    def all_systems(self) -> list[PeerSystem]:
+        """Return the published identity of every peer unit, plus self.
+
+        Covers every peer unit that has published a name and address, plus
+        self. Only entries with both a name and an address are returned; the
+        OVN and storage fields may be empty if unset or not applicable.
+        """
         relation = self.relation
         if relation is None:
             return []
 
-        members: list[tuple[str, str]] = []
+        members: list[PeerSystem] = []
         units = list(relation.units) + [self._charm.unit]
         for unit in units:
             data = relation.data.get(unit, {})
             name = data.get(_KEY_NAME, "")
             address = data.get(_KEY_ADDRESS, "")
+            ovn_uplink_interface = data.get(_KEY_OVN_UPLINK_INTERFACE, "")
+            ovn_underlay_ip = data.get(_KEY_OVN_UNDERLAY_IP, "")
+            storage_local_path = data.get(_KEY_STORAGE_LOCAL_PATH, "")
+            try:
+                storage_ceph_paths = json.loads(data.get(_KEY_STORAGE_CEPH_PATHS) or "[]")
+            except (json.JSONDecodeError, TypeError):
+                storage_ceph_paths = []
             if name and address:
-                members.append((name, address))
+                members.append(
+                    PeerSystem(
+                        name=name,
+                        address=address,
+                        ovn_uplink_interface=ovn_uplink_interface,
+                        ovn_underlay_ip=ovn_underlay_ip,
+                        storage_local_path=storage_local_path,
+                        storage_ceph_paths=storage_ceph_paths,
+                    )
+                )
         # De-duplicate while preserving order.
         seen: set[str] = set()
-        unique: list[tuple[str, str]] = []
-        for name, address in members:
-            if name not in seen:
-                seen.add(name)
-                unique.append((name, address))
+        unique: list[PeerSystem] = []
+        for system in members:
+            if system.name not in seen:
+                seen.add(system.name)
+                unique.append(system)
         return unique
 
     def expected_unit_count(self) -> int:

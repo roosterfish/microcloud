@@ -48,6 +48,7 @@ import time
 from typing import Any
 
 import ops
+import yaml
 from charms.grafana_agent.v0.cos_agent import COSAgentProvider
 
 import microcloud
@@ -188,8 +189,20 @@ class MicroCloudCharm(ops.CharmBase):
         """Drive deployment or observe-only mode, then set status."""
         self._make_helpers()
 
+        ovn_uplink_interface, problem = self._ovn_uplink_interface()
+        if problem:
+            self.unit.status = ops.BlockedStatus(problem)
+            return
+
         # Publish our identity for peers as early as possible.
-        self._coordinator.publish_identity(microcloud.hostname(), self._bind_address())
+        self._coordinator.publish_identity(
+            microcloud.hostname(),
+            self._bind_address(),
+            ovn_uplink_interface=ovn_uplink_interface,
+            ovn_underlay_ip=self._space_bind_address("ovn-underlay"),
+            storage_local_path=self._storage_local_path(),
+            storage_ceph_paths=self._storage_ceph_paths(),
+        )
 
         initialized = microcloud.is_initialized()
 
@@ -305,32 +318,78 @@ class MicroCloudCharm(ops.CharmBase):
 
         return self._bootstrap(passphrase or "", initiator_address)
 
-    def _bootstrap(self, passphrase: str, initiator_address: str) -> str | None:
-        """Render preseed and run it on this unit. Returns problem or None."""
-        members = self._coordinator.all_members()
-        systems = [SystemEntry(name=n, address=a) for n, a in members]
+    def _preseed_inputs(
+        self, initiator_address: str, passphrase: str, systems: list[SystemEntry]
+    ) -> PreseedInputs:
+        """Build the PreseedInputs for this unit's preseed document."""
+        with_ceph_storage = any(s.storage_ceph_paths for s in systems)
 
-        inputs = PreseedInputs(
+        return PreseedInputs(
             initiator_address=initiator_address,
             session_passphrase=passphrase,
             systems=systems,
             session_timeout=int(self.config.get("session-timeout", 300)),
             with_ceph=bool(self.config.get("snap-channel-microceph", "")),
             ceph_cephfs=bool(self.config.get("ceph-cephfs", False)),
-            ceph_public_network=self.config.get("ceph-public-network", ""),
-            ceph_internal_network=self.config.get("ceph-internal-network", ""),
+            # "microcloud preseed" rejects a public/internal network without
+            # Ceph storage disks ("Cannot specify a Ceph public network
+            # without Ceph storage disks"), so only derive these from the
+            # ceph-public/ceph-internal bindings when at least one system
+            # has a "ceph" Juju storage volume attached. Otherwise Juju's
+            # default-space fallback for an unbound extra-binding would
+            # still resolve to *some* subnet and produce an invalid
+            # preseed.
+            ceph_public_network=self._space_network_cidr("ceph-public")
+            if with_ceph_storage
+            else "",
+            ceph_internal_network=self._space_network_cidr("ceph-internal")
+            if with_ceph_storage
+            else "",
             with_ovn=bool(self.config.get("snap-channel-microovn", "")),
-            ovn_uplink_interface=self.config.get("ovn-uplink-interface", ""),
             ovn_ipv4_gateway=self.config.get("ovn-ipv4-gateway", ""),
             ovn_ipv4_range=self.config.get("ovn-ipv4-range", ""),
             ovn_ipv6_gateway=self.config.get("ovn-ipv6-gateway", ""),
             ovn_dns_servers=self.config.get("ovn-dns-servers", ""),
-            ovn_underlay_ip=self.config.get("ovn-underlay-ip", ""),
-            storage_local_find=self.config.get("storage-local-find", ""),
-            storage_ceph_find=self.config.get("storage-ceph-find", ""),
             storage_wipe=bool(self.config.get("storage-wipe", False)),
             storage_encrypt=bool(self.config.get("storage-encrypt", False)),
         )
+
+    def _storage_local_path(self) -> str:
+        """Return the device path of this unit's attached "local" Juju storage.
+
+        The "local" storage volume is declared with ``multiple: range: 0-1``
+        in charmcraft.yaml, so at most one instance is ever attached.
+        Returns "" if none is attached.
+        """
+        storages = self.model.storages["local"]
+        if not storages:
+            return ""
+        return str(storages[0].location)
+
+    def _storage_ceph_paths(self) -> list[str]:
+        """Return device paths of this unit's attached "ceph" Juju storage.
+
+        The "ceph" storage volume is declared with ``multiple: range: 0-``
+        in charmcraft.yaml, so any number of instances may be attached -
+        each becomes a separate Ceph OSD on this system.
+        """
+        return [str(storage.location) for storage in self.model.storages["ceph"]]
+
+    def _bootstrap(self, passphrase: str, initiator_address: str) -> str | None:
+        """Render preseed and run it on this unit. Returns problem or None."""
+        systems = [
+            SystemEntry(
+                name=system.name,
+                address=system.address,
+                ovn_uplink_interface=system.ovn_uplink_interface,
+                ovn_underlay_ip=system.ovn_underlay_ip,
+                storage_local_path=system.storage_local_path,
+                storage_ceph_paths=system.storage_ceph_paths,
+            )
+            for system in self._coordinator.all_systems()
+        ]
+
+        inputs = self._preseed_inputs(initiator_address, passphrase, systems)
 
         self.unit.status = ops.MaintenanceStatus("Bootstrapping MicroCloud cluster")
 
@@ -642,10 +701,92 @@ class MicroCloudCharm(ops.CharmBase):
 
     def _bind_address(self) -> str:
         """Return this unit's bind address for the peer relation."""
-        binding = self.model.get_binding("cluster")
-        if binding and binding.network and binding.network.bind_address:
-            return str(binding.network.bind_address)
-        return ""
+        return self._space_bind_address("cluster")
+
+    def _binding_network(self, binding_name: str) -> ops.Network | None:
+        """Return the Network for the given endpoint, or None if unavailable.
+
+        Both ``get_binding()`` and accessing its ``.network`` property can
+        raise "ModelError: no network config found for binding ..." when the
+        endpoint has no usable network info at all (e.g. an extra-binding
+        left unbound with no default space fallback), so both must be
+        guarded by the same try/except.
+        """
+        try:
+            binding = self.model.get_binding(binding_name)
+            if not binding:
+                return None
+            return binding.network
+        except ops.ModelError:
+            return None
+
+    def _space_bind_address(self, binding_name: str) -> str:
+        """Return this unit's bind address for the given endpoint, if any.
+
+        Since "network-get" is evaluated per-unit, binding an endpoint (e.g.
+        the "ovn-underlay" extra-binding) to a Juju space naturally yields a
+        different address per machine, unlike a single shared config value.
+        Returns "" if the endpoint has no usable address (e.g. left unbound).
+        """
+        network = self._binding_network(binding_name)
+        if not network or not network.bind_address:
+            return ""
+        return str(network.bind_address)
+
+    def _space_network_cidr(self, binding_name: str) -> str:
+        """Return the CIDR of the subnet bound to the given extra-binding, if any.
+
+        Lets operators point Ceph's public/internal network at a Juju space
+        (via "juju deploy --bind") instead of hard-coding a CIDR. Returns ""
+        if the endpoint has no usable subnet (e.g. left unbound).
+        """
+        network = self._binding_network(binding_name)
+        if not network or not network.interfaces:
+            return ""
+        subnet = network.interfaces[0].subnet
+        return str(subnet) if subnet else ""
+
+    def _ovn_uplink_interface(self) -> tuple[str, str | None]:
+        """Resolve this unit's OVN uplink interface name.
+
+        "ovn-uplink-interface" config is either a single interface name
+        applied to every unit, or a YAML/JSON mapping of hostname to
+        interface name (for hardware where the NIC name differs per
+        machine). When it is a mapping, every unit must have an entry: a
+        unit missing from the mapping cannot safely guess an interface
+        name, so it must block rather than bootstrap without one (or
+        silently omit the OVN uplink and produce a broken cluster).
+
+        There is deliberately no extra-binding fallback here: Juju spaces
+        only track addressed interfaces, but the OVN uplink NIC is
+        normally a bare, L2-only interface with no IP, so "network-get"
+        can never resolve it.
+
+        Returns (interface, problem). "problem" is a human-readable status
+        string if reconciliation should block; "interface" is only
+        meaningful when "problem" is None.
+        """
+        raw = str(self.config.get("ovn-uplink-interface", "")).strip()
+        if not raw:
+            return "", None
+
+        try:
+            parsed = yaml.safe_load(raw)
+        except yaml.YAMLError as exc:
+            return "", f"Cannot parse ovn-uplink-interface: {exc}"
+
+        if not isinstance(parsed, dict):
+            return raw, None
+
+        hostname = microcloud.hostname()
+        interface = parsed.get(hostname)
+        if not interface:
+            known = sorted(str(key) for key in parsed)
+            return "", (
+                f"ovn-uplink-interface is missing an entry for hostname {hostname!r}; "
+                f"known entries: {known}"
+            )
+        return str(interface), None
 
 
 def _lxc_config_set(key: str, value: str) -> None:

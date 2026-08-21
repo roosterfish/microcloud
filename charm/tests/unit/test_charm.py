@@ -530,36 +530,62 @@ class TestPreseed:
         assert "ceph" not in doc
 
     def test_ovn_uplink_section(self):
-        from preseed import build_preseed
+        from preseed import SystemEntry, build_preseed
 
         doc = build_preseed(
             self._inputs(
-                with_ovn=True, ovn_uplink_interface="eth1", ovn_ipv4_gateway="192.0.2.1/24"
+                systems=[
+                    SystemEntry(name="node1", address="10.0.0.1", ovn_uplink_interface="eth1"),
+                    SystemEntry(name="node2", address="10.0.0.2", ovn_uplink_interface="eth2"),
+                ],
+                with_ovn=True,
+                ovn_ipv4_gateway="192.0.2.1/24",
             )
         )
         assert doc["ovn"]["ipv4_gateway"] == "192.0.2.1/24"
-        for sysentry in doc["systems"]:
-            assert sysentry["ovn_uplink_interface"] == "eth1"
+        assert doc["systems"][0]["ovn_uplink_interface"] == "eth1"
+        assert doc["systems"][1]["ovn_uplink_interface"] == "eth2"
 
     def test_ovn_omitted_without_interface(self):
         from preseed import build_preseed
 
-        doc = build_preseed(self._inputs(with_ovn=True, ovn_uplink_interface=""))
+        doc = build_preseed(self._inputs(with_ovn=True))
         assert "ovn" not in doc
         assert "ovn_uplink_interface" not in doc["systems"][0]
 
-    def test_storage_filters(self):
-        from preseed import build_preseed
+    def test_storage_direct_paths(self):
+        from preseed import SystemEntry, build_preseed
 
         doc = build_preseed(
             self._inputs(
-                storage_local_find="size > 10GiB",
-                storage_ceph_find="type == nvme",
+                systems=[
+                    SystemEntry(
+                        name="node1",
+                        address="10.0.0.1",
+                        storage_local_path="/dev/nvme0n1",
+                        storage_ceph_paths=["/dev/nvme1n1", "/dev/nvme2n1"],
+                    ),
+                    SystemEntry(name="node2", address="10.0.0.2"),
+                ],
+                with_ceph=True,
                 storage_wipe=True,
             )
         )
-        assert doc["storage"]["local"][0] == {"find": "size > 10GiB", "wipe": True}
-        assert doc["storage"]["ceph"][0] == {"find": "type == nvme", "find_min": 1, "wipe": True}
+        assert doc["systems"][0]["storage"]["local"] == {
+            "path": "/dev/nvme0n1",
+            "wipe": True,
+        }
+        assert doc["systems"][0]["storage"]["ceph"] == [
+            {"path": "/dev/nvme1n1", "wipe": True},
+            {"path": "/dev/nvme2n1", "wipe": True},
+        ]
+        assert "storage" not in doc["systems"][1]
+
+    def test_storage_omitted_without_paths(self):
+        from preseed import build_preseed
+
+        doc = build_preseed(self._inputs())
+        assert "storage" not in doc["systems"][0]
 
     def test_render_produces_yaml(self):
         import yaml
@@ -632,6 +658,433 @@ class TestMembershipValidation:
 
         problems = validate_membership({"node1", "node3"}, {"node1"})
         assert any("node3" in p and "not a MicroCloud member" in p for p in problems)
+
+
+# ---------------------------------------------------------------------------
+# _binding_network (shared get_binding + .network access, both error-guarded)
+# ---------------------------------------------------------------------------
+
+
+class TestBindingNetwork:
+    def test_returns_network_from_binding(self):
+        from charm import MicroCloudCharm
+
+        network = MagicMock()
+        binding = MagicMock()
+        binding.network = network
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub.model.get_binding.return_value = binding
+
+        assert MicroCloudCharm._binding_network(stub, "ovn-uplink") is network
+        stub.model.get_binding.assert_called_once_with("ovn-uplink")
+
+    def test_returns_none_when_get_binding_raises(self):
+        import ops
+
+        from charm import MicroCloudCharm
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub.model.get_binding.side_effect = ops.ModelError("no such binding")
+
+        assert MicroCloudCharm._binding_network(stub, "ovn-uplink") is None
+
+    def test_returns_none_when_network_access_raises(self):
+        """Regression test: juju raises "no network config found for binding"
+        lazily, when accessing binding.network -- not when calling
+        get_binding() itself -- so both must be guarded by the same
+        try/except or an unbound extra-binding crashes the install hook."""
+        import ops
+
+        from charm import MicroCloudCharm
+
+        binding = MagicMock()
+        type(binding).network = property(
+            lambda self: (_ for _ in ()).throw(
+                ops.ModelError('no network config found for binding "ovn-uplink"')
+            )
+        )
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub.model.get_binding.return_value = binding
+
+        assert MicroCloudCharm._binding_network(stub, "ovn-uplink") is None
+
+    def test_returns_none_when_binding_falsy(self):
+        from charm import MicroCloudCharm
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub.model.get_binding.return_value = None
+
+        assert MicroCloudCharm._binding_network(stub, "ovn-uplink") is None
+
+
+# ---------------------------------------------------------------------------
+# _space_network_cidr (Juju space binding -> Ceph public/internal network)
+# ---------------------------------------------------------------------------
+
+
+class TestSpaceNetworkCidr:
+    def test_returns_cidr_from_bound_subnet(self):
+        import ipaddress
+
+        from charm import MicroCloudCharm
+
+        interface = MagicMock()
+        interface.subnet = ipaddress.ip_network("10.42.0.0/24")
+        network = MagicMock()
+        network.interfaces = [interface]
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub._binding_network.return_value = network
+
+        assert MicroCloudCharm._space_network_cidr(stub, "ceph-public") == "10.42.0.0/24"
+        stub._binding_network.assert_called_once_with("ceph-public")
+
+    def test_returns_empty_when_no_interfaces(self):
+        from charm import MicroCloudCharm
+
+        network = MagicMock()
+        network.interfaces = []
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub._binding_network.return_value = network
+
+        assert MicroCloudCharm._space_network_cidr(stub, "ceph-internal") == ""
+
+    def test_returns_empty_when_network_unavailable(self):
+        from charm import MicroCloudCharm
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub._binding_network.return_value = None
+
+        assert MicroCloudCharm._space_network_cidr(stub, "ceph-public") == ""
+
+
+# ---------------------------------------------------------------------------
+# _ovn_uplink_interface (config-derived, per-unit OVN uplink interface name)
+# ---------------------------------------------------------------------------
+
+
+class TestOvnUplinkInterface:
+    def test_empty_config_omits_uplink(self):
+        from charm import MicroCloudCharm
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub.config = {"ovn-uplink-interface": ""}
+
+        interface, problem = MicroCloudCharm._ovn_uplink_interface(stub)
+        assert interface == ""
+        assert problem is None
+
+    def test_plain_string_applies_to_every_unit(self):
+        from charm import MicroCloudCharm
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub.config = {"ovn-uplink-interface": "eth1"}
+
+        interface, problem = MicroCloudCharm._ovn_uplink_interface(stub)
+        assert interface == "eth1"
+        assert problem is None
+
+    def test_mapping_resolves_own_hostname(self):
+        from charm import MicroCloudCharm
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub.config = {"ovn-uplink-interface": "node1: eth1\nnode2: enp5s0\n"}
+
+        with patch("charm.microcloud.hostname", return_value="node2"):
+            interface, problem = MicroCloudCharm._ovn_uplink_interface(stub)
+        assert interface == "enp5s0"
+        assert problem is None
+
+    def test_mapping_missing_hostname_blocks(self):
+        from charm import MicroCloudCharm
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub.config = {"ovn-uplink-interface": '{"node1": "eth1", "node2": "enp5s0"}'}
+
+        with patch("charm.microcloud.hostname", return_value="node3"):
+            interface, problem = MicroCloudCharm._ovn_uplink_interface(stub)
+        assert interface == ""
+        assert problem is not None
+        assert "node3" in problem
+        assert "node1" in problem
+        assert "node2" in problem
+
+    def test_invalid_yaml_blocks(self):
+        from charm import MicroCloudCharm
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub.config = {"ovn-uplink-interface": "{unbalanced: ["}
+
+        interface, problem = MicroCloudCharm._ovn_uplink_interface(stub)
+        assert interface == ""
+        assert problem is not None
+
+
+# ---------------------------------------------------------------------------
+# ClusterCoordinator: per-unit OVN uplink interface / underlay IP
+# ---------------------------------------------------------------------------
+
+
+class TestClusterCoordinatorOvnFields:
+    def _harness(self):
+        import ops.testing
+
+        harness = ops.testing.Harness(
+            ops.testing.CharmBase,
+            meta="""
+name: test-charm
+peers:
+  cluster:
+    interface: microcloud-peer
+""",
+        )
+        harness.begin()
+        return harness
+
+    def test_all_systems_includes_ovn_fields(self):
+        from cluster import ClusterCoordinator, PeerSystem
+
+        harness = self._harness()
+        try:
+            coordinator = ClusterCoordinator(harness.charm)
+            rel_id = harness.add_relation("cluster", "test-charm")
+            harness.add_relation_unit(rel_id, "test-charm/1")
+
+            coordinator.publish_identity(
+                "node0",
+                "10.0.0.1",
+                ovn_uplink_interface="eth0",
+                ovn_underlay_ip="10.0.1.1",
+                storage_local_path="/dev/nvme0n1",
+                storage_ceph_paths=["/dev/nvme1n1", "/dev/nvme2n1"],
+            )
+            harness.update_relation_data(
+                rel_id,
+                "test-charm/1",
+                {
+                    "microcloud-name": "node1",
+                    "microcloud-address": "10.0.0.2",
+                    "microcloud-ovn-uplink-interface": "eth1",
+                    "microcloud-ovn-underlay-ip": "10.0.1.2",
+                    "microcloud-storage-local-path": "/dev/nvme0n1",
+                    "microcloud-storage-ceph-paths": '["/dev/nvme1n1"]',
+                },
+            )
+
+            systems = coordinator.all_systems()
+            assert (
+                PeerSystem(
+                    name="node0",
+                    address="10.0.0.1",
+                    ovn_uplink_interface="eth0",
+                    ovn_underlay_ip="10.0.1.1",
+                    storage_local_path="/dev/nvme0n1",
+                    storage_ceph_paths=["/dev/nvme1n1", "/dev/nvme2n1"],
+                )
+                in systems
+            )
+            assert (
+                PeerSystem(
+                    name="node1",
+                    address="10.0.0.2",
+                    ovn_uplink_interface="eth1",
+                    ovn_underlay_ip="10.0.1.2",
+                    storage_local_path="/dev/nvme0n1",
+                    storage_ceph_paths=["/dev/nvme1n1"],
+                )
+                in systems
+            )
+
+            members = coordinator.all_members()
+            assert ("node0", "10.0.0.1") in members
+            assert ("node1", "10.0.0.2") in members
+        finally:
+            harness.cleanup()
+
+    def test_all_systems_defaults_empty_ovn_fields(self):
+        from cluster import ClusterCoordinator, PeerSystem
+
+        harness = self._harness()
+        try:
+            coordinator = ClusterCoordinator(harness.charm)
+            harness.add_relation("cluster", "test-charm")
+
+            coordinator.publish_identity("node0", "10.0.0.1")
+
+            assert coordinator.all_systems() == [PeerSystem(name="node0", address="10.0.0.1")]
+        finally:
+            harness.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# _space_bind_address (Juju space binding -> per-unit address, e.g. OVN underlay)
+# ---------------------------------------------------------------------------
+
+
+class TestSpaceBindAddress:
+    def test_returns_address_from_binding(self):
+        from charm import MicroCloudCharm
+
+        network = MagicMock()
+        network.bind_address = "10.42.0.5"
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub._binding_network.return_value = network
+
+        assert MicroCloudCharm._space_bind_address(stub, "ovn-underlay") == "10.42.0.5"
+        stub._binding_network.assert_called_once_with("ovn-underlay")
+
+    def test_returns_empty_when_no_bind_address(self):
+        from charm import MicroCloudCharm
+
+        network = MagicMock()
+        network.bind_address = None
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub._binding_network.return_value = network
+
+        assert MicroCloudCharm._space_bind_address(stub, "ovn-underlay") == ""
+
+    def test_returns_empty_when_network_unavailable(self):
+        from charm import MicroCloudCharm
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub._binding_network.return_value = None
+
+        assert MicroCloudCharm._space_bind_address(stub, "ovn-underlay") == ""
+
+    def test_bind_address_delegates_to_cluster_binding(self):
+        from charm import MicroCloudCharm
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub._space_bind_address.return_value = "10.0.0.1"
+
+        assert MicroCloudCharm._bind_address(stub) == "10.0.0.1"
+        stub._space_bind_address.assert_called_once_with("cluster")
+
+
+# ---------------------------------------------------------------------------
+# _preseed_inputs (ceph public/internal network only derived with Ceph disks)
+# ---------------------------------------------------------------------------
+
+
+class TestPreseedInputs:
+    def _stub(self, config: dict, cidrs: dict):
+        from charm import MicroCloudCharm
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub.config = config
+        stub._space_network_cidr.side_effect = lambda name: cidrs.get(name, "")
+        return stub
+
+    def test_ceph_networks_omitted_without_ceph_storage_disks(self):
+        from charm import MicroCloudCharm
+
+        stub = self._stub(
+            config={"snap-channel-microceph": "squid/stable"},
+            cidrs={"ceph-public": "10.42.0.0/24", "ceph-internal": "10.42.1.0/24"},
+        )
+
+        inputs = MicroCloudCharm._preseed_inputs(stub, "10.0.0.1", "secret", [])
+
+        assert inputs.ceph_public_network == ""
+        assert inputs.ceph_internal_network == ""
+        # Regardless of a resolvable binding (e.g. Juju's default-space
+        # fallback for an endpoint that was never explicitly --bind-ed),
+        # the network must not be looked up at all without Ceph disks -
+        # "microcloud preseed" would otherwise reject the whole document.
+        stub._space_network_cidr.assert_not_called()
+
+    def test_ceph_networks_derived_with_ceph_storage_disks(self):
+        from charm import MicroCloudCharm
+        from preseed import SystemEntry
+
+        stub = self._stub(
+            config={"snap-channel-microceph": "squid/stable"},
+            cidrs={"ceph-public": "10.42.0.0/24", "ceph-internal": "10.42.1.0/24"},
+        )
+
+        systems = [
+            SystemEntry(
+                name="node1", address="10.0.0.1", storage_ceph_paths=["/dev/nvme1n1"]
+            )
+        ]
+        inputs = MicroCloudCharm._preseed_inputs(stub, "10.0.0.1", "secret", systems)
+
+        assert inputs.ceph_public_network == "10.42.0.0/24"
+        assert inputs.ceph_internal_network == "10.42.1.0/24"
+
+
+# ---------------------------------------------------------------------------
+# _storage_local_path / _storage_ceph_paths (device paths from Juju storage)
+# ---------------------------------------------------------------------------
+
+
+class TestStoragePaths:
+    def _harness(self):
+        import ops.testing
+
+        harness = ops.testing.Harness(
+            ops.testing.CharmBase,
+            meta="""
+name: test-charm
+storage:
+  local:
+    type: block
+    multiple:
+      range: 0-1
+  ceph:
+    type: block
+    multiple:
+      range: 0-
+""",
+        )
+        harness.begin()
+        return harness
+
+    def test_local_path_empty_when_unattached(self):
+        from charm import MicroCloudCharm
+
+        harness = self._harness()
+        try:
+            assert MicroCloudCharm._storage_local_path(harness.charm) == ""
+        finally:
+            harness.cleanup()
+
+    def test_ceph_paths_empty_when_unattached(self):
+        from charm import MicroCloudCharm
+
+        harness = self._harness()
+        try:
+            assert MicroCloudCharm._storage_ceph_paths(harness.charm) == []
+        finally:
+            harness.cleanup()
+
+    def test_local_path_returns_attached_device(self):
+        from charm import MicroCloudCharm
+
+        harness = self._harness()
+        try:
+            harness.add_storage("local", count=1, attach=True)
+            location = harness.charm.model.storages["local"][0].location
+            assert MicroCloudCharm._storage_local_path(harness.charm) == str(location)
+        finally:
+            harness.cleanup()
+
+    def test_ceph_paths_returns_all_attached_devices(self):
+        from charm import MicroCloudCharm
+
+        harness = self._harness()
+        try:
+            harness.add_storage("ceph", count=3, attach=True)
+            paths = MicroCloudCharm._storage_ceph_paths(harness.charm)
+            assert len(paths) == 3
+            assert all(path for path in paths)
+        finally:
+            harness.cleanup()
 
 
 # ---------------------------------------------------------------------------
