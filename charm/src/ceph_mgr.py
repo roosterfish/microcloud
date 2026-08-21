@@ -33,10 +33,22 @@ class CephMgrPrometheus:
     ----------
     port:
         Port on which the exporter should listen.  Defaults to 9283.
+    rbd_stats_pools:
+        Comma-separated list of RBD pools to collect per-image IO stats for
+        (mgr/prometheus/rbd_stats_pools). Empty (default) disables per-image
+        RBD stats, matching upstream MicroCeph's default.
+    enable_perf_metrics:
+        Include Ceph performance counters in the exporter output. Maps onto
+        mgr/prometheus/exclude_perf_counters (inverted), matching upstream
+        MicroCeph's enable-perf-metrics config. Defaults to False.
     """
 
-    def __init__(self, port: int = _DEFAULT_PORT) -> None:
+    def __init__(
+        self, port: int = _DEFAULT_PORT, rbd_stats_pools: str = "", enable_perf_metrics: bool = False
+    ) -> None:
         self._port = port
+        self._rbd_stats_pools = rbd_stats_pools
+        self._enable_perf_metrics = enable_perf_metrics
 
     # ------------------------------------------------------------------
     # Public interface
@@ -95,6 +107,14 @@ class CephMgrPrometheus:
         )
         self._ceph(
             "config", "set", "mgr", "mgr/prometheus/server_port", str(self._port),
+        )
+        if self._rbd_stats_pools:
+            self._ceph(
+                "config", "set", "mgr", "mgr/prometheus/rbd_stats_pools", self._rbd_stats_pools
+            )
+        self._ceph(
+            "config", "set", "mgr", "mgr/prometheus/exclude_perf_counters",
+            str(not self._enable_perf_metrics)
         )
 
     def disable(self) -> None:

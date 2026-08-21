@@ -213,18 +213,14 @@ class ClusterCoordinator:
     # Session passphrase (Juju secret, leader-owned)
     # ------------------------------------------------------------------
 
-    def ensure_passphrase(self, configured: str) -> str | None:
+    def ensure_passphrase(self) -> str | None:
         """Return the shared session passphrase.
 
-        If ``configured`` is non-empty, it is used verbatim. Otherwise the
-        leader generates a random passphrase and stores it in a Juju secret
-        shared with the peer relation. Non-leader units read it back from the
-        secret. Returns None if the passphrase is not yet available (e.g. a
-        non-leader unit before the leader has created the secret).
+        The leader generates a random passphrase and stores it in a Juju
+        secret shared with the peer relation. Non-leader units read it back
+        from the secret. Returns None if the passphrase is not yet available
+        (e.g. a non-leader unit before the leader has created the secret).
         """
-        if configured:
-            return configured
-
         relation = self.relation
         if relation is None:
             return None

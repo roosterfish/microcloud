@@ -162,6 +162,38 @@ class TestCephMgrPrometheus:
                 assert any("server_addr" in c for c in calls)
                 assert any("server_port" in c for c in calls)
 
+    def test_ensure_enabled_skips_rbd_stats_pools_when_empty(self):
+        ceph = CephMgrPrometheus(port=9283)
+        with patch.object(ceph, "is_mgr_active", return_value=True):
+            with patch.object(ceph, "_ceph") as mock_ceph:
+                ceph.ensure_enabled()
+                calls = [str(c) for c in mock_ceph.call_args_list]
+                assert not any("rbd_stats_pools" in c for c in calls)
+
+    def test_ensure_enabled_sets_rbd_stats_pools_when_configured(self):
+        ceph = CephMgrPrometheus(port=9283, rbd_stats_pools="pool1,pool2")
+        with patch.object(ceph, "is_mgr_active", return_value=True):
+            with patch.object(ceph, "_ceph") as mock_ceph:
+                ceph.ensure_enabled()
+                calls = [str(c) for c in mock_ceph.call_args_list]
+                assert any("rbd_stats_pools" in c and "pool1,pool2" in c for c in calls)
+
+    def test_ensure_enabled_excludes_perf_counters_by_default(self):
+        ceph = CephMgrPrometheus(port=9283)
+        with patch.object(ceph, "is_mgr_active", return_value=True):
+            with patch.object(ceph, "_ceph") as mock_ceph:
+                ceph.ensure_enabled()
+                calls = [str(c) for c in mock_ceph.call_args_list]
+                assert any("exclude_perf_counters" in c and "True" in c for c in calls)
+
+    def test_ensure_enabled_includes_perf_counters_when_enabled(self):
+        ceph = CephMgrPrometheus(port=9283, enable_perf_metrics=True)
+        with patch.object(ceph, "is_mgr_active", return_value=True):
+            with patch.object(ceph, "_ceph") as mock_ceph:
+                ceph.ensure_enabled()
+                calls = [str(c) for c in mock_ceph.call_args_list]
+                assert any("exclude_perf_counters" in c and "False" in c for c in calls)
+
 
 # ---------------------------------------------------------------------------
 # ovn_exporter tests
@@ -281,6 +313,74 @@ class TestScrapeConfigs:
         assert "microcloud-lxd" in job_names
         assert "microcloud-microceph" in job_names
         assert "microcloud-microovn" in job_names
+
+    def test_microceph_job_honors_intrinsic_instance_labels(self):
+        """Ceph mgr's own per-host "instance" labels (e.g. ceph_disk_occupation)
+
+        must survive scraping untouched, otherwise Prometheus renames them to
+        "exported_instance" and overwrites "instance" with the scrape target
+        address, which is identical on every unit and collapses per-host
+        panels/variables in the bundled dashboards.
+        """
+        stub = self._make_charm_stub(
+            {
+                "enable-lxd": False,
+                "enable-microceph": True,
+                "enable-microovn": False,
+                "microcloud-cluster-name": "test-cluster",
+                "scrape-interval": "30s",
+                "ceph-mgr-prometheus-port": 9283,
+            }
+        )
+        stub._ceph = CephMgrPrometheus(port=9283)
+        stub._ovn = OVNExporter()
+
+        with (
+            patch.object(stub._ceph, "is_mgr_active", return_value=True),
+            patch("microcloud.socket.gethostname", return_value="node1"),
+            patch("charm.subprocess.run", return_value=MagicMock(returncode=1, stdout="")),
+        ):
+            from charm import MicroCloudCharm
+
+            configs = MicroCloudCharm._build_scrape_configs(stub)
+
+        ceph_job = next(c for c in configs if c["job_name"] == "microcloud-microceph")
+        assert ceph_job["honor_labels"] is True
+
+    def test_microceph_job_relabels_fallback_instance_to_member(self):
+        """Metrics lacking their own "instance" label fall back to the scrape
+
+        target (127.0.0.1:<port>), which is meaningless and identical across
+        units; it must be rewritten to this unit's member name.
+        """
+        stub = self._make_charm_stub(
+            {
+                "enable-lxd": False,
+                "enable-microceph": True,
+                "enable-microovn": False,
+                "microcloud-cluster-name": "test-cluster",
+                "scrape-interval": "30s",
+                "ceph-mgr-prometheus-port": 9283,
+            }
+        )
+        stub._ceph = CephMgrPrometheus(port=9283)
+        stub._ovn = OVNExporter()
+
+        with (
+            patch.object(stub._ceph, "is_mgr_active", return_value=True),
+            patch("microcloud.socket.gethostname", return_value="node1"),
+            patch("charm.subprocess.run", return_value=MagicMock(returncode=1, stdout="")),
+        ):
+            from charm import MicroCloudCharm
+
+            configs = MicroCloudCharm._build_scrape_configs(stub)
+            expected_member = stub._member_label()
+
+        ceph_job = next(c for c in configs if c["job_name"] == "microcloud-microceph")
+        relabel = ceph_job["metric_relabel_configs"][0]
+        assert relabel["source_labels"] == ["instance"]
+        assert relabel["regex"] == "127\\.0\\.0\\.1:9283"
+        assert relabel["replacement"] == expected_member
 
     def test_lxd_job_uses_https_with_ca_file(self):
         """LXD scrape job must use https scheme and trust the cluster cert via ca_file.

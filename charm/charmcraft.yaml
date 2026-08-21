@@ -111,14 +111,6 @@ config:
     # ------------------------------------------------------------------
     # Cluster bootstrap / session (deployment mode only)
     # ------------------------------------------------------------------
-    session-passphrase:
-      type: string
-      default: ""
-      description: >
-        Shared passphrase used to authenticate the MicroCloud trust
-        establishment session. If empty (default), the leader generates a
-        random passphrase and shares it with peers via a Juju secret.
-
     session-timeout:
       type: int
       default: 300
@@ -129,41 +121,6 @@ config:
         own lookup-timeout default (60s), so the initiator reliably
         outlasts joiners whose own hooks may run on a delayed Juju
         schedule.
-
-    lookup-timeout:
-      type: int
-      default: 300
-      description: >
-        Seconds a joiner waits for the initiator to reply once connected.
-        Bumped from the MicroCloud CLI default (60s) to 5 min so slow
-        installs/config-changed backlogs don't cause the join attempt to
-        time out. Note this only bounds the wait *after* connecting; if the
-        initiator has not started its own "microcloud preseed" session yet,
-        the joiner is rejected immediately ("No active session") rather
-        than waiting - see bootstrap-retries for handling that race.
-
-    bootstrap-retries:
-      type: int
-      default: 10
-      description: >
-        How many times to retry "microcloud preseed" within a single hook
-        execution if it fails. We use unicast (not multicast) joining, so
-        a joiner must dial the initiator's already-open session; if the
-        joiner's own hook runs before the initiator has started its
-        session (still installing snaps, or its hook hasn't fired yet),
-        the joiner is rejected immediately with "No active session"
-        rather than waiting, since no timeout governs that race. Retrying
-        a few times lets the joiner catch up once the initiator's session
-        is open, instead of waiting for Juju's much slower periodic
-        update-status reconciliation. Set to 0 to disable and rely solely
-        on update-status retries.
-
-    bootstrap-retry-delay:
-      type: int
-      default: 15
-      description: >
-        Seconds to wait between "microcloud preseed" retries (see
-        bootstrap-retries).
 
     # ------------------------------------------------------------------
     # Ceph preseed options
@@ -271,6 +228,22 @@ config:
       description: >
         Port on which the Ceph mgr Prometheus module listens on loopback.
 
+    ceph-rbd-stats-pools:
+      type: string
+      default: ""
+      description: >
+        Comma-separated list of RBD pools to collect per-image IO statistics
+        for (mgr/prometheus/rbd_stats_pools). Empty (default) disables
+        per-image RBD stats, required by the bundled rbd-details and
+        rbd-overview dashboards.
+
+    ceph-enable-perf-metrics:
+      type: boolean
+      default: false
+      description: >
+        Include Ceph performance counters in the Prometheus mgr module
+        output (mgr/prometheus/exclude_perf_counters, inverted).
+
     ovn-exporter-channel:
       type: string
       default: "latest/edge"
@@ -314,23 +287,12 @@ config:
         the charm.
 
 actions:
-  bootstrap:
-    description: >
-      Manually (re-)trigger MicroCloud cluster bootstrap via preseed. Only
-      valid in deployment mode (when MicroCloud is not already initialized).
-      Normally the charm does this automatically once all peers are present.
-
   status:
     description: >
       Print the detected charm mode and the current MicroCloud cluster
       membership as seen by this unit.
 
-  force-reconcile:
-    description: >
-      Re-run idempotent setup steps: deployment reconciliation and, when the
-      cos-agent relation is present, observability endpoint configuration.
-
-  dump-config:
+  dump-metrics-config:
     description: >
       Print the cos-agent scrape configs this unit is advertising. Useful for
       debugging observability integration.

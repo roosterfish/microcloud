@@ -20,8 +20,8 @@ install / config-changed / peer-relation-changed
       has actually opened its session. A generous session-timeout default
       (5 min) keeps the initiator's session open long enough to absorb
       timing skew between independently scheduled Juju hooks, and
-      bootstrap-retries/bootstrap-retry-delay retry "microcloud preseed"
-      a few times within the same hook execution if a unit's own attempt
+      bootstrap retries "microcloud preseed" (10 times, 15s apart, both
+      fixed) within the same hook execution if a unit's own attempt
       lands before the initiator's session has opened.
 
 Observe-only mode (MicroCloud already initialized out-of-band)
@@ -42,6 +42,7 @@ cos-agent-relation-broken
 
 import json
 import logging
+import re
 import subprocess
 import time
 from typing import Any
@@ -118,10 +119,8 @@ class MicroCloudCharm(ops.CharmBase):
         )
 
         # Actions
-        self.framework.observe(self.on.bootstrap_action, self._on_bootstrap_action)
         self.framework.observe(self.on.status_action, self._on_status_action)
-        self.framework.observe(self.on.force_reconcile_action, self._on_force_reconcile)
-        self.framework.observe(self.on.dump_config_action, self._on_dump_config)
+        self.framework.observe(self.on.dump_metrics_config_action, self._on_dump_metrics_config)
 
     # ------------------------------------------------------------------
     # Helpers factory
@@ -130,6 +129,8 @@ class MicroCloudCharm(ops.CharmBase):
     def _make_helpers(self) -> None:
         self._ceph = CephMgrPrometheus(
             port=int(self.config.get("ceph-mgr-prometheus-port", 9283)),
+            rbd_stats_pools=self.config.get("ceph-rbd-stats-pools", ""),
+            enable_perf_metrics=self.config.get("ceph-enable-perf-metrics", False),
         )
         self._ovn = OVNExporter(
             channel=self.config.get("ovn-exporter-channel", "latest/edge"),
@@ -262,7 +263,7 @@ class MicroCloudCharm(ops.CharmBase):
             self.unit.status = ops.WaitingStatus("Waiting for all peers to report identity")
             return None
 
-        passphrase = self._coordinator.ensure_passphrase(self.config.get("session-passphrase", ""))
+        passphrase = self._coordinator.ensure_passphrase()
         if len(self._coordinator.all_members()) > 1 and not passphrase:
             self.unit.status = ops.WaitingStatus("Waiting for session passphrase")
             return None
@@ -314,7 +315,6 @@ class MicroCloudCharm(ops.CharmBase):
             session_passphrase=passphrase,
             systems=systems,
             session_timeout=int(self.config.get("session-timeout", 300)),
-            lookup_timeout=int(self.config.get("lookup-timeout", 300)),
             with_ceph=bool(self.config.get("snap-channel-microceph", "")),
             ceph_cephfs=bool(self.config.get("ceph-cephfs", False)),
             ceph_public_network=self.config.get("ceph-public-network", ""),
@@ -335,19 +335,21 @@ class MicroCloudCharm(ops.CharmBase):
         self.unit.status = ops.MaintenanceStatus("Bootstrapping MicroCloud cluster")
 
         rendered = render(inputs)
-        retries = max(int(self.config.get("bootstrap-retries", 10)), 0)
-        retry_delay = max(int(self.config.get("bootstrap-retry-delay", 15)), 0)
+        retries = 10
+        retry_delay = 15
 
         # We use unicast (not multicast) joining: a joiner must dial the
         # initiator's already-open session. If this unit's own hook runs
         # before the initiator has started its session (e.g. still
         # installing snaps, or its hook simply hasn't fired yet on Juju's
         # independent per-unit schedule), the daemon rejects the attempt
-        # immediately with "No active session" rather than waiting -
-        # lookup-timeout only bounds the wait *after* a session is found,
-        # so it does not help here. Retrying a few times lets this unit
-        # catch up once the initiator's session opens, instead of waiting
-        # for Juju's much slower periodic update-status reconciliation.
+        # immediately with "No active session" rather than waiting - the
+        # MicroCloud CLI's lookup_timeout only bounds the wait *after* a
+        # session is found (and only applies to multicast discovery, which
+        # this charm never uses), so it does not help here. Retrying a few
+        # times lets this unit catch up once the initiator's session
+        # opens, instead of waiting for Juju's much slower periodic
+        # update-status reconciliation.
         last_exc: microcloud.MicroCloudError | None = None
         for attempt in range(retries + 1):
             try:
@@ -482,24 +484,6 @@ class MicroCloudCharm(ops.CharmBase):
     # Action handlers
     # ------------------------------------------------------------------
 
-    def _on_bootstrap_action(self, event: ops.ActionEvent) -> None:
-        if microcloud.is_initialized():
-            event.fail("MicroCloud is already initialized on this node")
-            return
-        if not self.unit.is_leader():
-            event.fail("Bootstrap must be run on the leader unit")
-            return
-        self._make_helpers()
-        self._coordinator.publish_identity(microcloud.hostname(), self._bind_address())
-        passphrase = self._coordinator.ensure_passphrase(self.config.get("session-passphrase", ""))
-        self._coordinator.publish_initiator_address(self._bind_address())
-        problem = self._bootstrap(passphrase or "", self._bind_address())
-        if problem:
-            event.fail(problem)
-        else:
-            event.set_results({"result": "Bootstrap completed"})
-            self._reconcile()
-
     def _on_status_action(self, event: ops.ActionEvent) -> None:
         initialized = microcloud.is_initialized()
         result: dict[str, Any] = {
@@ -516,14 +500,7 @@ class MicroCloudCharm(ops.CharmBase):
                 result["members-error"] = str(exc)
         event.set_results(result)
 
-    def _on_force_reconcile(self, event: ops.ActionEvent) -> None:
-        try:
-            self._reconcile()
-            event.set_results({"result": "Reconciliation completed"})
-        except Exception as exc:  # noqa: BLE001
-            event.fail(str(exc))
-
-    def _on_dump_config(self, event: ops.ActionEvent) -> None:
+    def _on_dump_metrics_config(self, event: ops.ActionEvent) -> None:
         self._make_helpers()
         configs = self._build_scrape_configs()
         event.set_results({"scrape-configs": json.dumps(configs, indent=2)})
@@ -568,20 +545,45 @@ class MicroCloudCharm(ops.CharmBase):
         # ---- MicroCeph ----
         if self.config.get("enable-microceph", True) and self._ceph.is_mgr_active():
             ceph_port = self.config.get("ceph-mgr-prometheus-port", 9283)
+            ceph_target = f"127.0.0.1:{ceph_port}"
             configs.append(
                 {
                     "job_name": "microcloud-microceph",
                     "scrape_interval": interval,
                     "metrics_path": "/metrics",
+                    # The Ceph mgr exporter tags per-host metrics (e.g.
+                    # ceph_disk_occupation) with their own "instance" label
+                    # identifying the owning host. honor_labels keeps that
+                    # label as-is instead of renaming it to
+                    # "exported_instance" and overwriting "instance" with the
+                    # scrape target address, which is identical
+                    # (127.0.0.1:<port>) on every unit and would collapse
+                    # per-host panels/variables in the bundled dashboards.
+                    "honor_labels": True,
                     "static_configs": [
                         {
-                            "targets": [f"127.0.0.1:{ceph_port}"],
+                            "targets": [ceph_target],
                             "labels": {
                                 "microcloud_service": "microceph",
                                 "microcloud_member": member,
                                 "microcloud_cluster": cluster,
                             },
                         }
+                    ],
+                    "metric_relabel_configs": [
+                        {
+                            # Metrics without their own per-host "instance"
+                            # label (e.g. cluster-wide summaries) still fall
+                            # back to the scrape target address, which is
+                            # meaningless and identical across units.
+                            # Replace it with this unit's member name so it
+                            # stays unique and matches microcloud_member.
+                            "source_labels": ["instance"],
+                            "regex": re.escape(ceph_target),
+                            "target_label": "instance",
+                            "action": "replace",
+                            "replacement": member,
+                        },
                     ],
                 }
             )
